@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/usr/bin/env bash 
 
 echo "Worker Initiated"
 
@@ -13,7 +13,7 @@ export LD_PRELOAD="${TCMALLOC}"
 export PYTHONUNBUFFERED=true
 export HF_HOME="/workspace"
 cd /workspace/ComfyUI
-python main.py --port 3000 > /workspace/logs/comfyui-serverless.log 2>&1 &
+python main.py --port 3000 --lowvram > /workspace/logs/comfyui-serverless.log 2>&1 &
 deactivate
 
 echo "Starting RunPod Handler"

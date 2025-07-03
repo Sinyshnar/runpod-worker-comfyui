@@ -609,27 +609,39 @@ def handler(event):
                 # Job was processed successfully
                 outputs = resp_json[prompt_id]['outputs']
 
-                if len(outputs):
-                    logging.info(f'Images generated successfully for prompt: {prompt_id}', job_id)
-                    output_images = get_output_images(outputs)
-                    images = []
+                logging.info(f'Images generated successfully for prompt: {prompt_id}', job_id)
+                output_images = get_output_images(outputs)
+                images = []
 
-                    for output_image in output_images:
-                        filename = output_image.get('filename')
+                for output_image in output_images:
+                    filename = output_image.get('filename')
 
-                        if output_image['type'] == 'output':
-                            image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
+                    if output_image['type'] == 'output':
+                        image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
 
-                            if os.path.exists(image_path):
-                                with open(image_path, 'rb') as image_file:
-                                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                                    images.append(image_data)
-                                    logging.info(f'Deleting output file: {image_path}', job_id)
-                                    os.remove(image_path)
-                        elif output_image['type'] == 'temp':
-                            image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}'
+                        if os.path.exists(image_path):
+                            with open(image_path, 'rb') as image_file:
+                                image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                                images.append(image_data)
+                                logging.info(f'Deleting output file: {image_path}', job_id)
+                                os.remove(image_path)
+                    elif output_image['type'] == 'temp':
+                        image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}'
 
-                            # Clean up temp images that aren't used by the API
+                        # Clean up temp images that aren't used by the API
+                        if os.path.exists(image_path):
+                            logging.info(f'Deleting temp file: {image_path}', job_id)
+
+                            try:
+                                os.remove(image_path)
+                            except Exception as e:
+                                logging.error(f'Error deleting temp file {image_path}: {e}')
+                        else:
+                            # Check if the image exists in the /tmp directory
+                            # NOTE: This is a specific workaround in a ComfyUI fork, and should
+                            # not be present in the official ComfyUI Github repository.
+                            image_path = f'/tmp/{filename}'
+
                             if os.path.exists(image_path):
                                 logging.info(f'Deleting temp file: {image_path}', job_id)
 
@@ -637,35 +649,21 @@ def handler(event):
                                     os.remove(image_path)
                                 except Exception as e:
                                     logging.error(f'Error deleting temp file {image_path}: {e}')
-                            else:
-                                # Check if the image exists in the /tmp directory
-                                # NOTE: This is a specific workaround in a ComfyUI fork, and should
-                                # not be present in the official ComfyUI Github repository.
-                                image_path = f'/tmp/{filename}'
 
-                                if os.path.exists(image_path):
-                                    logging.info(f'Deleting temp file: {image_path}', job_id)
+                response = {
+                    'images': images
+                }
 
-                                    try:
-                                        os.remove(image_path)
-                                    except Exception as e:
-                                        logging.error(f'Error deleting temp file {image_path}: {e}')
+                # Refresh worker if memory is low
+                memory_info = get_container_memory_info(job_id)
+                memory_available_gb = memory_info.get('available')
 
-                    response = {
-                        'images': images
-                    }
+                if memory_available_gb is not None and memory_available_gb < 1.0:
+                    logging.info(f'Low memory detected: {memory_available_gb:.2f} GB available, refreshing worker', job_id)
+                    response['refresh_worker'] = True
 
-                    # Refresh worker if memory is low
-                    memory_info = get_container_memory_info(job_id)
-                    memory_available_gb = memory_info.get('available')
+                return response
 
-                    if memory_available_gb is not None and memory_available_gb < 1.0:
-                        logging.info(f'Low memory detected: {memory_available_gb:.2f} GB available, refreshing worker', job_id)
-                        response['refresh_worker'] = True
-
-                    return response
-                else:
-                    raise RuntimeError(f'No output found for prompt id: {prompt_id}')
             else:
                 # Job did not process successfully
                 for message in status['messages']:

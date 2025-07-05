@@ -213,17 +213,25 @@ def get_workflow_payload(workflow_name, payload):
     return workflow
 
 
-def get_output_images(output):
+def get_output_files(output):
     """
-    Get the output images
+    Get the output files (primarily images, as text files are usually just saved to disk)
     """
-    images = []
+    files = []
 
     for key, value in output.items():
+        # Handle image outputs
         if 'images' in value and isinstance(value['images'], list):
-            images.append(value['images'][0])
+            for image in value['images']:
+                files.append({
+                    'type': 'image',
+                    'data': image
+                })
+        
+        # Note: Text outputs from SaveText nodes typically don't appear in the ComfyUI output structure
+        # They are saved directly to disk and need to be found via filesystem scanning
 
-    return images
+    return files
 
 
 
@@ -231,13 +239,27 @@ def create_unique_filename_prefix(payload):
     """
     Create a unique filename prefix for each request to avoid a race condition where
     more than one request completes at the same time, which can either result in the
-    incorrect output being returned, or the output image not being found.
+    incorrect output being returned, or the output file not being found.
     """
     for key, value in payload.items():
         class_type = value.get('class_type')
 
+        # Handle image output nodes
         if class_type == 'SaveImage':
             payload[key]['inputs']['filename_prefix'] = str(uuid.uuid4())
+        
+        # Handle text output nodes (common ComfyUI text output node types)
+        elif class_type in ['SaveText|pysssss', 'SaveText', 'TextFileOutput', 'WriteTextFile']:
+            if 'filename_prefix' in payload[key]['inputs']:
+                payload[key]['inputs']['filename_prefix'] = str(uuid.uuid4())
+            elif 'file' in payload[key]['inputs']:
+                # For SaveText|pysssss node, the filename field is called 'file'
+                original_filename = payload[key]['inputs']['file']
+                payload[key]['inputs']['file'] = f"{str(uuid.uuid4())}_{original_filename}"
+            elif 'filename' in payload[key]['inputs']:
+                # If there's a filename field, prepend the UUID
+                original_filename = payload[key]['inputs']['filename']
+                payload[key]['inputs']['filename'] = f"{str(uuid.uuid4())}_{original_filename}"
 
 
 # ---------------------------------------------------------------------------- #
@@ -609,39 +631,30 @@ def handler(event):
                 # Job was processed successfully
                 outputs = resp_json[prompt_id]['outputs']
 
-                logging.info(f'Images generated successfully for prompt: {prompt_id}', job_id)
-                output_images = get_output_images(outputs)
+                logging.info(f'Files generated successfully for prompt: {prompt_id}', job_id)
+                output_files = get_output_files(outputs)
                 images = []
+                text_files = []
 
-                for output_image in output_images:
-                    filename = output_image.get('filename')
+                # Process image files from ComfyUI output structure
+                for output_file in output_files:
+                    if output_file['type'] == 'image':
+                        filename = output_file['data'].get('filename')
+                        file_type = output_file['data'].get('type')
 
-                    if output_image['type'] == 'output':
-                        image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
+                        if file_type == 'output':
+                            image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
 
-                        if os.path.exists(image_path):
-                            with open(image_path, 'rb') as image_file:
-                                image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                                images.append(image_data)
-                                logging.info(f'Deleting output file: {image_path}', job_id)
-                                os.remove(image_path)
-                    elif output_image['type'] == 'temp':
-                        image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}'
+                            if os.path.exists(image_path):
+                                with open(image_path, 'rb') as image_file:
+                                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                                    images.append(image_data)
+                                    logging.info(f'Deleting output file: {image_path}', job_id)
+                                    os.remove(image_path)
+                        elif file_type == 'temp':
+                            image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}'
 
-                        # Clean up temp images that aren't used by the API
-                        if os.path.exists(image_path):
-                            logging.info(f'Deleting temp file: {image_path}', job_id)
-
-                            try:
-                                os.remove(image_path)
-                            except Exception as e:
-                                logging.error(f'Error deleting temp file {image_path}: {e}')
-                        else:
-                            # Check if the image exists in the /tmp directory
-                            # NOTE: This is a specific workaround in a ComfyUI fork, and should
-                            # not be present in the official ComfyUI Github repository.
-                            image_path = f'/tmp/{filename}'
-
+                            # Clean up temp images that aren't used by the API
                             if os.path.exists(image_path):
                                 logging.info(f'Deleting temp file: {image_path}', job_id)
 
@@ -649,10 +662,50 @@ def handler(event):
                                     os.remove(image_path)
                                 except Exception as e:
                                     logging.error(f'Error deleting temp file {image_path}: {e}')
+                            else:
+                                # Check if the image exists in the /tmp directory
+                                # NOTE: This is a specific workaround in a ComfyUI fork, and should
+                                # not be present in the official ComfyUI Github repository.
+                                image_path = f'/tmp/{filename}'
+
+                                if os.path.exists(image_path):
+                                    logging.info(f'Deleting temp file: {image_path}', job_id)
+
+                                    try:
+                                        os.remove(image_path)
+                                    except Exception as e:
+                                        logging.error(f'Error deleting temp file {image_path}: {e}')
+
+                # Text files are saved directly to disk by SaveText nodes and need to be found via filesystem scanning
+                # Extract unique prefix from the payload for better file matching
+                unique_prefix = None
+                for key, value in payload.items():
+                    if isinstance(value, dict) and 'inputs' in value:
+                        if 'filename_prefix' in value['inputs']:
+                            unique_prefix = value['inputs']['filename_prefix']
+                            break
+                        elif 'file' in value['inputs'] and isinstance(value['inputs']['file'], str):
+                            # For SaveText|pysssss node, extract the UUID prefix from the filename
+                            filename = value['inputs']['file']
+                            if '_' in filename:
+                                unique_prefix = filename.split('_')[0]
+                                break
+                        elif 'filename' in value['inputs'] and isinstance(value['inputs']['filename'], str):
+                            # Extract UUID prefix from filename
+                            filename = value['inputs']['filename']
+                            if '_' in filename:
+                                unique_prefix = filename.split('_')[0]
+                                break
+                
+                text_files = scan_for_text_files(job_id, unique_prefix)
 
                 response = {
                     'images': images
                 }
+                
+                # Add text files to response if any were generated
+                if text_files:
+                    response['text_files'] = text_files
 
                 # Refresh worker if memory is low
                 memory_info = get_container_memory_info(job_id)
@@ -702,6 +755,63 @@ def handler(event):
             'error': traceback.format_exc(),
             'refresh_worker': True
         }
+
+
+def scan_for_text_files(job_id, unique_prefix=None):
+    """
+    Scan output directories for text files saved by SaveText nodes.
+    SaveText nodes save files directly to disk and don't appear in ComfyUI's output structure.
+    """
+    text_files = []
+    
+    # Common text file extensions
+    text_extensions = ['.txt', '.json', '.xml', '.csv', '.log', '.md', '.yaml', '.yml']
+    
+    # Directories to scan
+    scan_dirs = [
+        f'{VOLUME_MOUNT_PATH}/ComfyUI/output',
+        f'{VOLUME_MOUNT_PATH}/ComfyUI/temp',
+        '/tmp'
+    ]
+    
+    for scan_dir in scan_dirs:
+        try:
+            if os.path.exists(scan_dir):
+                for filename in os.listdir(scan_dir):
+                    file_path = os.path.join(scan_dir, filename)
+                    
+                    # Check if it's a text file
+                    if any(filename.lower().endswith(ext) for ext in text_extensions):
+                        # If we have a unique prefix, only process files with that prefix
+                        if unique_prefix and not filename.startswith(unique_prefix):
+                            continue
+                            
+                        try:
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                content = f.read()
+                                text_files.append({
+                                    'filename': filename,
+                                    'content': content
+                                })
+                                logging.info(f'Found and processed additional text file: {file_path}', job_id)
+                                os.remove(file_path)
+                        except Exception as e:
+                            # Try reading as binary with UTF-8 decoding
+                            try:
+                                with open(file_path, 'rb') as f:
+                                    content = f.read().decode('utf-8', errors='replace')
+                                    text_files.append({
+                                        'filename': filename,
+                                        'content': content
+                                    })
+                                    logging.info(f'Found and processed additional text file (binary mode): {file_path}', job_id)
+                                    os.remove(file_path)
+                            except Exception as e2:
+                                logging.error(f'Error processing additional text file {file_path}: {e2}', job_id)
+        except Exception as e:
+            logging.warning(f'Error scanning directory {scan_dir}: {e}', job_id)
+    
+    return text_files
 
 
 def setup_logging():

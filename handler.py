@@ -550,6 +550,58 @@ def get_container_disk_info(job_id=None):
         return {}
 
 
+def find_output_file(filename, file_type, job_id=None):
+    """
+    Find an output file in multiple possible locations.
+    ComfyUI may save files to different paths depending on the environment and configuration.
+    
+    Args:
+        filename: The filename to search for
+        file_type: 'output' or 'temp' - the type of file to search for
+        job_id: Optional job ID for logging
+        
+    Returns:
+        The full path to the file if found, None otherwise
+    """
+    possible_paths = []
+    
+    if file_type == 'output':
+        possible_paths = [
+            f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}',  # Primary expected path
+            f'/workspace/ComfyUI/output/{filename}',           # Symlinked workspace path
+            f'/tmp/workspace/ComfyUI/output/{filename}',       # Test/temp workspace path
+            f'/ComfyUI/output/{filename}',                     # Absolute ComfyUI path
+            f'./ComfyUI/output/{filename}',                    # Relative ComfyUI path
+            f'/app/ComfyUI/output/{filename}',                 # Alternative app path
+            f'output/{filename}',                              # Simple relative path
+            f'{filename}',                                     # Current directory
+        ]
+    elif file_type == 'temp':
+        possible_paths = [
+            f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}',    # Primary expected path
+            f'/workspace/ComfyUI/temp/{filename}',             # Symlinked workspace path
+            f'/tmp/workspace/ComfyUI/temp/{filename}',         # Test/temp workspace path
+            f'/ComfyUI/temp/{filename}',                       # Absolute ComfyUI path
+            f'./ComfyUI/temp/{filename}',                      # Relative ComfyUI path
+            f'/app/ComfyUI/temp/{filename}',                   # Alternative app path
+            f'/tmp/{filename}',                                # Common temp directory
+            f'temp/{filename}',                                # Simple relative path
+            f'{filename}',                                     # Current directory
+        ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            if job_id:
+                logging.debug(f'Found {file_type} file at: {path}', job_id)
+            return path
+    
+    # If file not found, log the paths we checked for debugging
+    if job_id:
+        logging.warning(f'{file_type.title()} file "{filename}" not found in any of these locations: {", ".join(possible_paths)}', job_id)
+    
+    return None
+
+
 # ---------------------------------------------------------------------------- #
 #                                RunPod Handler                                #
 # ---------------------------------------------------------------------------- #
@@ -632,49 +684,47 @@ def handler(event):
                 outputs = resp_json[prompt_id]['outputs']
 
                 logging.info(f'Files generated successfully for prompt: {prompt_id}', job_id)
+                logging.debug(f'ComfyUI outputs structure: {json.dumps(outputs, indent=2)}', job_id)
                 output_files = get_output_files(outputs)
+                logging.info(f'Extracted {len(output_files)} output files from ComfyUI response', job_id)
                 images = []
                 text_files = []
 
                 # Process image files from ComfyUI output structure
-                for output_file in output_files:
+                for i, output_file in enumerate(output_files):
+                    logging.debug(f'Processing output file {i+1}/{len(output_files)}: {output_file}', job_id)
                     if output_file['type'] == 'image':
                         filename = output_file['data'].get('filename')
                         file_type = output_file['data'].get('type')
+                        logging.info(f'Processing image file: {filename} (type: {file_type})', job_id)
 
                         if file_type == 'output':
-                            image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
-
-                            if os.path.exists(image_path):
-                                with open(image_path, 'rb') as image_file:
-                                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                                    images.append(image_data)
-                                    logging.info(f'Deleting output file: {image_path}', job_id)
-                                    os.remove(image_path)
+                            image_path = find_output_file(filename, 'output', job_id)
+                            
+                            if image_path:
+                                try:
+                                    with open(image_path, 'rb') as image_file:
+                                        image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                                        images.append(image_data)
+                                        logging.info(f'Successfully processed and encoded image: {image_path}', job_id)
+                                        logging.info(f'Deleting output file: {image_path}', job_id)
+                                        os.remove(image_path)
+                                except Exception as e:
+                                    logging.error(f'Error processing output file {image_path}: {e}', job_id)
+                            else:
+                                logging.warning(f'Output file not found: {filename}', job_id)
                         elif file_type == 'temp':
-                            image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}'
-
+                            image_path = find_output_file(filename, 'temp', job_id)
+                            
                             # Clean up temp images that aren't used by the API
-                            if os.path.exists(image_path):
+                            if image_path:
                                 logging.info(f'Deleting temp file: {image_path}', job_id)
-
                                 try:
                                     os.remove(image_path)
                                 except Exception as e:
                                     logging.error(f'Error deleting temp file {image_path}: {e}')
                             else:
-                                # Check if the image exists in the /tmp directory
-                                # NOTE: This is a specific workaround in a ComfyUI fork, and should
-                                # not be present in the official ComfyUI Github repository.
-                                image_path = f'/tmp/{filename}'
-
-                                if os.path.exists(image_path):
-                                    logging.info(f'Deleting temp file: {image_path}', job_id)
-
-                                    try:
-                                        os.remove(image_path)
-                                    except Exception as e:
-                                        logging.error(f'Error deleting temp file {image_path}: {e}')
+                                logging.warning(f'Temp file not found: {filename}', job_id)
 
                 # Text files are saved directly to disk by SaveText nodes and need to be found via filesystem scanning
                 # Extract unique prefix from the payload for better file matching
@@ -706,6 +756,9 @@ def handler(event):
                 # Add text files to response if any were generated
                 if text_files:
                     response['text_files'] = text_files
+
+                logging.info(f'Response prepared with {len(images)} images and {len(text_files)} text files', job_id)
+                logging.debug(f'Final response structure: {json.dumps({k: f"<{len(v)} items>" if isinstance(v, list) else v for k, v in response.items()}, indent=2)}', job_id)
 
                 # Refresh worker if memory is low
                 memory_info = get_container_memory_info(job_id)
@@ -767,11 +820,21 @@ def scan_for_text_files(job_id, unique_prefix=None):
     # Common text file extensions
     text_extensions = ['.txt', '.json', '.xml', '.csv', '.log', '.md', '.yaml', '.yml']
     
-    # Directories to scan
+    # Directories to scan - check multiple possible locations
     scan_dirs = [
         f'{VOLUME_MOUNT_PATH}/ComfyUI/output',
         f'{VOLUME_MOUNT_PATH}/ComfyUI/temp',
-        '/tmp'
+        f'/workspace/ComfyUI/output',
+        f'/workspace/ComfyUI/temp',
+        f'/ComfyUI/output',
+        f'/ComfyUI/temp',
+        f'./ComfyUI/output',
+        f'./ComfyUI/temp',
+        f'/app/ComfyUI/output',
+        f'/app/ComfyUI/temp',
+        '/tmp',
+        'output',
+        'temp'
     ]
     
     for scan_dir in scan_dirs:

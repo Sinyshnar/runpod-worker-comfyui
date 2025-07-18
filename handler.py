@@ -826,6 +826,8 @@ def scan_for_text_files(job_id, unique_prefix=None):
         f'{VOLUME_MOUNT_PATH}/ComfyUI/temp',
         f'/workspace/ComfyUI/output',
         f'/workspace/ComfyUI/temp',
+        f'/tmp/workspace/ComfyUI/output',
+        f'/tmp/workspace/ComfyUI/temp',
         f'/ComfyUI/output',
         f'/ComfyUI/temp',
         f'./ComfyUI/output',

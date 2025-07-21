@@ -9,6 +9,8 @@ import uuid
 import logging
 import logging.handlers
 import runpod
+import io
+from PIL import Image
 from runpod.serverless.utils.rp_validator import validate
 from runpod.serverless.modules.rp_logger import RunPodLogger
 from requests.adapters import HTTPAdapter, Retry
@@ -22,6 +24,7 @@ LOG_FILE = 'comfyui-worker.log'
 TIMEOUT = 600
 LOG_LEVEL = 'INFO'
 DISK_MIN_FREE_BYTES = 500 * 1024 * 1024  # 500MB in bytes
+JPEG_QUALITY = 95  # JPEG quality for output images (1-100, higher = better quality)
 
 
 # ---------------------------------------------------------------------------- #
@@ -211,6 +214,43 @@ def get_workflow_payload(workflow_name, payload):
         workflow = get_txt2img_payload(workflow, payload)
 
     return workflow
+
+
+def convert_image_to_jpeg(image_path, quality=JPEG_QUALITY):
+    """
+    Convert an image file to JPEG format and return base64 encoded data.
+    
+    Args:
+        image_path (str): Path to the image file
+        quality (int): JPEG quality (1-100, higher = better quality)
+    
+    Returns:
+        str: Base64 encoded JPEG image data
+    """
+    try:
+        # Open the image with PIL
+        with Image.open(image_path) as img:
+            # Convert RGBA to RGB if necessary (JPEG doesn't support transparency)
+            if img.mode in ('RGBA', 'LA'):
+                # Create a white background
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'RGBA':
+                    background.paste(img, mask=img.split()[-1])  # Use alpha channel as mask
+                else:
+                    background.paste(img)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Save as JPEG to a BytesIO buffer
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=quality, optimize=True)
+            buffer.seek(0)
+            
+            # Encode to base64
+            return base64.b64encode(buffer.getvalue()).decode('utf-8')
+    except Exception as e:
+        raise Exception(f"Failed to convert image {image_path} to JPEG: {str(e)}")
 
 
 def get_output_files(output):
@@ -646,11 +686,12 @@ def handler(event):
                             image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
 
                             if os.path.exists(image_path):
-                                with open(image_path, 'rb') as image_file:
-                                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
-                                    images.append(image_data)
-                                    logging.info(f'Deleting output file: {image_path}', job_id)
-                                    os.remove(image_path)
+                                # Convert image to JPEG and base64 encode
+                                image_data = convert_image_to_jpeg(image_path)
+                                images.append(image_data)
+                                logging.info(f'Converted and encoded image to JPEG: {image_path}', job_id)
+                                logging.info(f'Deleting output file: {image_path}', job_id)
+                                os.remove(image_path)
                         elif file_type == 'temp':
                             image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/temp/{filename}'
 

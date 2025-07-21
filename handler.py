@@ -686,9 +686,33 @@ def handler(event):
                             image_path = f'{VOLUME_MOUNT_PATH}/ComfyUI/output/{filename}'
 
                             if os.path.exists(image_path):
+                                # Log the image file size before conversion
+                                image_size_bytes = os.path.getsize(image_path)
+                                image_size_mb = image_size_bytes / (1024 * 1024)
+                                logging.info(f'Output image size: {image_size_bytes} bytes ({image_size_mb:.2f} MB) for {image_path}', job_id)
                                 # Convert image to JPEG and base64 encode
-                                image_data = convert_image_to_jpeg(image_path)
-                                images.append(image_data)
+                                # Save JPEG to a temp buffer to get its size
+                                try:
+                                    with Image.open(image_path) as img:
+                                        if img.mode in ('RGBA', 'LA'):
+                                            background = Image.new('RGB', img.size, (255, 255, 255))
+                                            if img.mode == 'RGBA':
+                                                background.paste(img, mask=img.split()[-1])
+                                            else:
+                                                background.paste(img)
+                                            img = background
+                                        elif img.mode != 'RGB':
+                                            img = img.convert('RGB')
+                                        buffer = io.BytesIO()
+                                        img.save(buffer, format='JPEG', quality=JPEG_QUALITY, optimize=True)
+                                        jpeg_bytes = buffer.getvalue()
+                                        jpeg_size_bytes = len(jpeg_bytes)
+                                        jpeg_size_mb = jpeg_size_bytes / (1024 * 1024)
+                                        logging.info(f'JPEG image size: {jpeg_size_bytes} bytes ({jpeg_size_mb:.2f} MB) for {image_path}', job_id)
+                                        image_data = base64.b64encode(jpeg_bytes).decode('utf-8')
+                                        images.append(image_data)
+                                except Exception as e:
+                                    logging.error(f'Error converting image to JPEG and logging size: {e}', job_id)
                                 logging.info(f'Converted and encoded image to JPEG: {image_path}', job_id)
                                 logging.info(f'Deleting output file: {image_path}', job_id)
                                 os.remove(image_path)
